@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	lowlevel "github.com/trezor/trezord-go/usb/lowlevel/libusb"
 
@@ -120,6 +121,25 @@ func (l *LibUSBDeviceList) infos() (res []core.USBInfo) {
 	return
 }
 
+// types for communicating with the enumeration
+// goroutine
+type enumResult struct {
+	result []core.USBInfo
+	err    error
+}
+
+type connectResult struct {
+	result *LibUSBDevice
+	err    error
+}
+
+type connectConsumer struct {
+	path    int
+	debug   bool
+	reset   bool
+	channel chan connectResult
+}
+
 type LibUSB struct {
 	usb    lowlevel.Context
 	mw     *memorywriter.MemoryWriter
@@ -127,7 +147,12 @@ type LibUSB struct {
 	cancel bool
 	detach bool
 
-	list *LibUSBDeviceList
+	// this deals with the goroutine
+	startEnum        chan struct{}
+	consumersEnum    [](chan enumResult)
+	consumersConnect []connectConsumer
+	consumerLock     sync.Mutex
+	stop             chan struct{}
 }
 
 func InitLibUSB(mw *memorywriter.MemoryWriter, onlyLibusb, allowCancel, detach bool) (*LibUSB, error) {
@@ -142,21 +167,25 @@ func InitLibUSB(mw *memorywriter.MemoryWriter, onlyLibusb, allowCancel, detach b
 
 	mw.Log("init done")
 
-	return &LibUSB{
-		usb:    usb,
-		mw:     mw,
-		only:   onlyLibusb,
-		cancel: allowCancel,
-		detach: detach,
-		list: &LibUSBDeviceList{
-			lastDevices: make(map[int](*device)),
-		},
-	}, nil
+	r := &LibUSB{
+		usb:       usb,
+		mw:        mw,
+		only:      onlyLibusb,
+		cancel:    allowCancel,
+		detach:    detach,
+		startEnum: make(chan struct{}),
+		stop:      make(chan struct{}),
+	}
+
+	go r.backgroundEnumerate()
+
+	return r, nil
 }
 
 func (b *LibUSB) Close() {
 	b.mw.Log("all close (should happen only on exit)")
 	lowlevel.Exit(b.usb)
+	b.stop <- struct{}{}
 }
 
 func detectDebug(dev lowlevel.Device) (bool, error) {
@@ -181,24 +210,10 @@ func detectDebug(dev lowlevel.Device) (bool, error) {
 	return false, nil
 }
 
-func (b *LibUSB) devicesByPorts() (
+func (b *LibUSB) devicesByPorts(list []lowlevel.Device) (
 	devices map[string]*device,
-	err error,
 ) {
 	devices = make(map[string]*device)
-	b.mw.Log("low level enumerating")
-	list, err := lowlevel.Get_Device_List(b.usb)
-
-	if err != nil {
-		return
-	}
-	b.mw.Log("low level enumerating done")
-
-	defer func() {
-		b.mw.Log("freeing device list")
-		lowlevel.Free_Device_List(list, 1) // unlink devices
-		b.mw.Log("freeing device list done")
-	}()
 
 	for _, dev := range list {
 		m, t := b.match(dev)
@@ -233,15 +248,87 @@ func (b *LibUSB) devicesByPorts() (
 	return
 }
 
-func (b *LibUSB) Enumerate() ([]core.USBInfo, error) {
-	b.mw.Log("low level enumerating")
-	devs, err := b.devicesByPorts()
-	if err != nil {
-		return nil, err
+func (b *LibUSB) backgroundEnumerate() {
+	doWork := false
+	list := &LibUSBDeviceList{
+		lastDevices: make(map[int](*device)),
 	}
-	b.list.add(devs)
-	b.list.cleanup(devs)
-	return b.list.infos(), nil
+	for {
+		b.mw.Log("for cycle")
+		select {
+		case <-b.stop:
+			return
+		default:
+		}
+		if !doWork {
+			<-b.startEnum
+		}
+		time.Sleep(5 * time.Second)
+		select {
+		case <-b.stop:
+			return
+		default:
+		}
+		var res []core.USBInfo
+		b.mw.Log("low level enumerating")
+		llist, err := lowlevel.Get_Device_List(b.usb)
+		b.mw.Log("low level enumerating done")
+		if err == nil {
+			b.mw.Log("low level enumerating successful, do magic")
+			devs := b.devicesByPorts(llist)
+			list.add(devs)
+			list.cleanup(devs)
+			res = list.infos()
+			b.mw.Log("freeing device list")
+			lowlevel.Free_Device_List(llist, 1) // unlink devices
+		}
+		b.consumerLock.Lock()
+		for _, consumer := range b.consumersEnum {
+			consumer <- enumResult{
+				result: res,
+				err:    err,
+			}
+		}
+		for _, consumer := range b.consumersConnect {
+			path := consumer.path
+			if list.lastDevices[path] == nil {
+				consumer.channel <- connectResult{
+					result: nil,
+					err:    ErrNotFound,
+				}
+			} else {
+				// This is already fixed in libusb 2.0.12;
+				// however, 2.0.12 has other problems with windows, so we
+				// patchfix it here
+				mydevs := list.lastDevices[path].devices
+				res, errConn := b.connectFirst(mydevs, consumer.debug, consumer.reset)
+				consumer.channel <- connectResult{
+					result: res,
+					err:    errConn,
+				}
+			}
+		}
+		b.consumersEnum = nil
+		b.consumersConnect = nil
+		b.consumerLock.Unlock()
+		doWork = len(list.lastDevices) > 0
+	}
+}
+
+func (b *LibUSB) Enumerate() ([]core.USBInfo, error) {
+	b.mw.Log("contacting gouroutine")
+	resChan := make(chan enumResult)
+	b.consumerLock.Lock()
+	b.consumersEnum = append(b.consumersEnum, resChan)
+	b.consumerLock.Unlock()
+
+	select {
+	case b.startEnum <- struct{}{}:
+	default:
+	}
+
+	res := <-resChan
+	return res.result, res.err
 }
 
 func (b *LibUSB) Has(path string) bool {
@@ -249,37 +336,31 @@ func (b *LibUSB) Has(path string) bool {
 }
 
 func (b *LibUSB) Connect(path string, debug bool, reset bool) (core.USBDevice, error) {
-	b.mw.Log("reenumerating")
-	_, err := b.Enumerate()
-
-	if err != nil {
-		return nil, err
-	}
-	b.mw.Log("low level enumerating done")
 
 	id, err := strconv.Atoi(strings.TrimPrefix(path, libusbPrefix))
 	if err != nil {
 		return nil, err
 	}
 
-	if b.list.lastDevices[id] == nil {
-		return nil, ErrNotFound
+	b.mw.Log("contacting gouroutine")
+	resChan := make(chan connectResult)
+	b.consumerLock.Lock()
+	b.consumersConnect = append(b.consumersConnect, connectConsumer{
+		path:    id,
+		channel: resChan,
+		debug:   debug,
+		reset:   reset,
+	})
+	b.consumerLock.Unlock()
+
+	select {
+	case b.startEnum <- struct{}{}:
+	default:
 	}
 
-	// This is already fixed in libusb 2.0.12;
-	// however, 2.0.12 has other problems with windows, so we
-	// patchfix it here
-	mydevs := b.list.lastDevices[id].devices
+	res := <-resChan
+	return res.result, res.err
 
-	err = ErrNotFound
-	for _, dev := range mydevs {
-		res, errConn := b.connect(dev, debug, reset)
-		if errConn == nil {
-			return res, nil
-		}
-		err = errConn
-	}
-	return nil, err
 }
 
 func (b *LibUSB) setConfiguration(d lowlevel.Device_Handle) {
@@ -346,6 +427,22 @@ func (b *LibUSB) claimInterface(d lowlevel.Device_Handle, debug bool) (bool, err
 	b.mw.Log("claiming interface done")
 
 	return attach, nil
+}
+
+func (b *LibUSB) connectFirst(
+	devs []lowlevel.Device,
+	debug bool,
+	reset bool,
+) (*LibUSBDevice, error) {
+	err := ErrNotFound
+	for _, dev := range devs {
+		res, errConn := b.connect(dev, debug, reset)
+		if errConn == nil {
+			return res, nil
+		}
+		err = errConn
+	}
+	return nil, err
 }
 
 func (b *LibUSB) connect(dev lowlevel.Device, debug bool, reset bool) (*LibUSBDevice, error) {
